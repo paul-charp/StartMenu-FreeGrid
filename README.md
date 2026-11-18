@@ -6,7 +6,7 @@ Place pinned apps and folders freely on a grid in the Windows 11 Start menu, emp
 
 ## Install
 
-Download `StartMenu-FreeGrid-Setup-<version>.exe` from [Releases](https://github.com/paul-charp/StartMenu-FreeGrid/releases) and run it. Per-user, no admin. The installer is unsigned, so SmartScreen warns: More info > Run anyway. A portable zip is also on the release page.
+Download `StartMenu-FreeGrid-Setup-<version>.exe` from [Releases](https://github.com/paul-charp/StartMenu-FreeGrid/releases) and run it. Per-user, no admin. The installer is unsigned, so SmartScreen warns: More info > Run anyway.
 
 ## Use
 

@@ -25,8 +25,5 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: StartMenu-FreeGrid
-          path: |
-            build/StartGrid.exe
-            build/StartGrid.dll
-            build/StartMenu-FreeGrid-Setup-*.exe
+          path: build/StartMenu-FreeGrid-Setup-*.exe
           if-no-files-found: error
