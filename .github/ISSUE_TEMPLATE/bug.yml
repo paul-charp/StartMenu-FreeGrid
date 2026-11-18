@@ -1,0 +1,34 @@
+name: Bug
+description: Something doesn't work
+labels: [bug]
+body:
+  - type: input
+    id: build
+    attributes:
+      label: Windows build
+      placeholder: "26300.9974"
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Version
+      description: Output of `StartGrid.exe version`
+    validations:
+      required: true
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps
+  - type: textarea
+    id: log
+    attributes:
+      label: Log
+      description: Output of `StartGrid.exe log`
+      render: text

@@ -1,0 +1,32 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Inno Setup
+        shell: pwsh
+        run: |
+          if (-not (Test-Path 'C:\Program Files (x86)\Inno Setup 6\ISCC.exe')) {
+            choco install innosetup -y --no-progress
+          }
+      - name: Build
+        shell: pwsh
+        run: ./build.ps1 -Installer
+      - uses: actions/upload-artifact@v4
+        with:
+          name: StartMenu-FreeGrid
+          path: |
+            build/StartGrid.exe
+            build/StartGrid.dll
+            build/StartMenu-FreeGrid-Setup-*.exe
+          if-no-files-found: error

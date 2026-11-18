@@ -1,0 +1,4 @@
+LIBRARY StartGrid
+EXPORTS
+    DllGetClassObject PRIVATE
+    DllCanUnloadNow PRIVATE

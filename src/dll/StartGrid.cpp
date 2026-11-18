@@ -1,40 +1,7 @@
-// ==WindhawkMod==
-// @id              start-menu-free-grid
-// @name            Start menu free grid
-// @description     Place pinned Start items freely on a grid, empty cells kept
-// @version         0.2
-// @author          paul-charp
-// @github          https://github.com/paul-charp
-// @include         StartMenuExperienceHost.exe
-// @architecture    x86-64
-// @compilerOptions -lole32 -loleaut32 -lruntimeobject
-// @license         MIT
-// ==/WindhawkMod==
+#include "host.h"
 
-// ==WindhawkModReadme==
-/*
-# Start menu free grid
-
-Pinned apps and folders sit on a free grid in Start. Empty cells stay empty.
-
-- Drag a tile to any cell. Dropping on a tile swaps the two.
-- Move left / right / to front move by one cell, or to the first cell.
-- Folders: right-click > Create a new app folder.
-- Disable the mod to get the stock layout back.
-*/
-// ==/WindhawkModReadme==
-
-// ==WindhawkModSettings==
-/*
-- columns: 0
-  $name: Columns
-  $description: 0 = fit Start width
-- rows: 0
-  $name: Rows
-  $description: 0 = up to the last used row
-*/
-// ==/WindhawkModSettings==
-
+#include <unknwn.h>
+#include <CoreWindow.h>
 #include <xamlom.h>
 
 #undef GetCurrentTime  // winbase.h macro breaks the XAML projection
@@ -70,10 +37,6 @@ using Controls::GridViewItem;
 
 namespace {
 
-// {3B0F6E2A-8C41-4D7E-9A55-1F2C7B9D4E62}
-constexpr CLSID CLSID_Tap = {
-    0x3b0f6e2a, 0x8c41, 0x4d7e, {0x9a, 0x55, 0x1f, 0x2c, 0x7b, 0x9d, 0x4e, 0x62}};
-
 constexpr wchar_t kPinnedType[] = L"Windows.UI.Xaml.Controls.GridView";
 constexpr wchar_t kPinnedName[] = L"PinnedList";
 constexpr ULONGLONG kPendingDropMs = 5000;
@@ -90,8 +53,8 @@ Settings g_settings;
 
 void LoadSettings() {
     Settings s;
-    s.columns = Wh_GetIntSetting(L"columns");
-    s.rows = Wh_GetIntSetting(L"rows");
+    s.columns = GetGridInt(L"columns");
+    s.rows = GetGridInt(L"rows");
     std::lock_guard lock(g_settingsLock);
     g_settings = s;
 }
@@ -104,7 +67,7 @@ Settings CurrentSettings() {
 // ------------------------------------------------------------ cell storage
 
 // Key -> cell. Key is the tile's AUMID, or "folder:<name>" for folders.
-// Loaded in Wh_ModInit, then touched on Start's UI thread only.
+// Loaded on activation, then touched on Start's UI thread only.
 struct Cell {
     int row;
     int col;
@@ -113,9 +76,8 @@ struct Cell {
 std::map<std::wstring, Cell> g_cells;
 
 void LoadCells() {
-    std::vector<wchar_t> buf(1 << 16);
-    Wh_GetStringValue(L"cells", buf.data(), buf.size());
-    std::wstring text(buf.data());
+    g_cells.clear();
+    std::wstring text = ReadCells();
     size_t pos = 0;
     while (pos < text.size()) {
         size_t end = text.find(L'\n', pos);
@@ -132,7 +94,7 @@ void LoadCells() {
         g_cells[line.substr(0, t1)] = {_wtoi(line.c_str() + t1 + 1),
                                        _wtoi(line.c_str() + t2 + 1)};
     }
-    Wh_Log(L"Loaded %zu cells", g_cells.size());
+    Log(L"Loaded %zu cells", g_cells.size());
 }
 
 void SaveCells() {
@@ -141,7 +103,7 @@ void SaveCells() {
         text += key + L"\t" + std::to_wstring(cell.row) + L"\t" +
                 std::to_wstring(cell.col) + L"\n";
     }
-    Wh_SetStringValue(L"cells", text.c_str());
+    WriteCells(text);
 }
 
 // ---------------------------------------------------------- grid state (UI)
@@ -202,11 +164,24 @@ struct State {
 
 State g_state;
 wuc::CoreDispatcher g_dispatcher{nullptr};
+std::mutex g_dispatcherLock;
 std::atomic<bool> g_unloading{false};
-bool g_failed = false;  // after an error, stay out until Start restarts
+std::atomic<bool> g_failed{false};  // after an error, stay out until Start restarts
 
 void Layout(const GridView& gv);
 std::optional<Cell> CursorCell();
+
+wuc::CoreDispatcher GetDispatcher() {
+    std::lock_guard lock(g_dispatcherLock);
+    return g_dispatcher;
+}
+
+void SetDispatcherIfNone(const wuc::CoreDispatcher& d) {
+    std::lock_guard lock(g_dispatcherLock);
+    if (!g_dispatcher) {
+        g_dispatcher = d;
+    }
+}
 
 std::wstring ItemId(const GridViewItem& c) {
     std::wstring id(Automation::AutomationProperties::GetAutomationId(c));
@@ -264,8 +239,8 @@ void MoveTo(const std::wstring& key, Cell target) {
     }
     it->second = target;
     SaveCells();
-    Wh_Log(L"Moved %s to row %d, column %d%s", key.c_str(), target.row,
-           target.col, other.empty() ? L"" : L" (swapped)");
+    Log(L"Moved %s to row %d, column %d%s", key.c_str(), target.row,
+        target.col, other.empty() ? L"" : L" (swapped)");
 }
 
 // --------------------------------------------------------------- highlight
@@ -422,9 +397,9 @@ void Restore() {
                 SetLocal(panel, UIElement::AllowDropProperty(),
                          g_state.origPanelAllowDrop);
             }
-            Wh_Log(L"Stock layout restored");
+            Log(L"Stock layout restored");
         } catch (...) {
-            Wh_Log(L"Restore failed: 0x%08X", winrt::to_hresult());
+            Log(L"Restore failed: 0x%08X", winrt::to_hresult());
         }
     }
     g_state = State{};
@@ -592,8 +567,8 @@ void Layout(const GridView& gv) {
             g_cells[e.key] = FromIndex(cell);
             changed = true;
         }
-        Wh_Log(L"Placed %s at row %d, column %d (%s)", e.key.c_str(),
-               cell / cols, cell % cols, why);
+        Log(L"Placed %s at row %d, column %d (%s)", e.key.c_str(),
+            cell / cols, cell % cols, why);
     };
 
     // 2. A tile that took the list index of a vanished one takes its cell:
@@ -681,7 +656,7 @@ void Layout(const GridView& gv) {
     double height = rows * g_state.cellH;
     if (g_state.height != height) {
         g_state.height = height;
-        Wh_Log(L"Grid %dx%d cells", cols, rows);
+        Log(L"Grid %dx%d cells", cols, rows);
     }
     SetHeightIfNeeded(gv, height);
     SetHeightIfNeeded(g_state.host.get(), height);
@@ -721,14 +696,6 @@ std::optional<Cell> CellIfInside(DragEventArgs const& e) {
     return CellIfInside(e.GetPosition(p));
 }
 
-// ICoreWindowInterop isn't in the mingw headers.
-struct CoreWindowInterop : IUnknown {
-    virtual HRESULT STDMETHODCALLTYPE get_WindowHandle(HWND* hwnd) = 0;
-    virtual HRESULT STDMETHODCALLTYPE put_MessageHandled(unsigned char value) = 0;
-};
-constexpr IID IID_CoreWindowInterop = {
-    0x45d64a29, 0xa63e, 0x4cb6, {0xb4, 0x98, 0x57, 0x81, 0xd2, 0x98, 0xcb, 0x4f}};
-
 // Cell under the mouse cursor right now, if it is over the grid. Drops out
 // of an open folder never reach the grid's events, but when the app shows up
 // in the grid the cursor is still where it was dropped.
@@ -738,16 +705,11 @@ std::optional<Cell> CursorCell() {
     if (!panel || !window || !window.CoreWindow() || !window.Content()) {
         return std::nullopt;
     }
-    CoreWindowInterop* interop = nullptr;
+    auto interop = window.CoreWindow().try_as<ICoreWindowInterop>();
     HWND hwnd = nullptr;
-    if (FAILED(winrt::get_unknown(window.CoreWindow())
-                   ->QueryInterface(IID_CoreWindowInterop,
-                                    reinterpret_cast<void**>(&interop))) ||
-        !interop) {
+    if (!interop || FAILED(interop->get_WindowHandle(&hwnd))) {
         return std::nullopt;
     }
-    interop->get_WindowHandle(&hwnd);
-    interop->Release();
     POINT pt;
     if (!hwnd || !GetCursorPos(&pt) || !ScreenToClient(hwnd, &pt)) {
         return std::nullopt;
@@ -770,7 +732,7 @@ auto Guarded(F fn) {
         try {
             fn(args...);
         } catch (...) {
-            Wh_Log(L"Handler error 0x%08X", winrt::to_hresult());
+            Log(L"Handler error 0x%08X", winrt::to_hresult());
         }
     };
 }
@@ -836,7 +798,7 @@ void HookPanel(const GridView& gv, const Controls::Panel& panel) {
             }
             if (cell && GetTickCount64() - g_state.externalLogTime > 1000) {
                 g_state.externalLogTime = GetTickCount64();
-                Wh_Log(L"External drag over row %d, column %d", cell->row, cell->col);
+                Log(L"External drag over row %d, column %d", cell->row, cell->col);
             }
         })));
     g_state.dragLeaveHandler = winrt::box_value(DragEventHandler(
@@ -850,11 +812,11 @@ void HookPanel(const GridView& gv, const Controls::Panel& panel) {
             if (auto cell = CellIfInside(e)) {
                 g_state.pendingDrop = *cell;
                 g_state.pendingDropTime = GetTickCount64();
-                Wh_Log(L"External drop at row %d, column %d", cell->row, cell->col);
+                Log(L"External drop at row %d, column %d", cell->row, cell->col);
             } else {
                 auto pt = g_state.panel.get() ? e.GetPosition(g_state.panel.get())
                                               : wf::Point{};
-                Wh_Log(L"External drop outside the grid (%.0f, %.0f)", pt.X, pt.Y);
+                Log(L"External drop outside the grid (%.0f, %.0f)", pt.X, pt.Y);
             }
         })));
     UIElement root = gv;
@@ -873,15 +835,15 @@ void HookPanel(const GridView& gv, const Controls::Panel& panel) {
         Guarded([](auto&&, Controls::DragItemsStartingEventArgs const& a) {
             if (a.Items().Size() > 0) {
                 g_state.dragItem = a.Items().GetAt(0);
-                Wh_Log(L"Drag started: %s", KeyOfItem(g_state.dragItem).c_str());
+                Log(L"Drag started: %s", KeyOfItem(g_state.dragItem).c_str());
                 // Changing CanReorderItems inside DragItemsStarting cancels
                 // the drag: switch it once the drag is running.
-                if (g_dispatcher) {
-                    g_dispatcher.RunAsync(
+                if (auto dispatcher = GetDispatcher()) {
+                    dispatcher.RunAsync(
                         wuc::CoreDispatcherPriority::Low, Guarded([] {
                             if (auto gv = g_state.view.get(); gv && g_state.dragItem) {
                                 gv.CanReorderItems(false);
-                                Wh_Log(L"Native reorder off for the drag");
+                                Log(L"Native reorder off for the drag");
                             }
                         }));
                 }
@@ -921,8 +883,8 @@ bool TryApply(const GridView& gv) {
     }
     auto wrap = root.try_as<Controls::ItemsWrapGrid>();
     if (!wrap) {
-        Wh_Log(L"Unexpected pinned panel %s, leaving Start as is",
-               winrt::get_class_name(root).c_str());
+        Log(L"Unexpected pinned panel %s, leaving Start as is",
+            winrt::get_class_name(root).c_str());
         return true;  // give up, keep the stock layout
     }
 
@@ -958,7 +920,7 @@ bool TryApply(const GridView& gv) {
         }
     }
     if (!g_state.host.get()) {
-        Wh_Log(L"StartMenu.PinnedList host not found, extra rows may clip");
+        Log(L"StartMenu.PinnedList host not found, extra rows may clip");
     }
 
     g_state.origReorder = gv.CanReorderItems();
@@ -971,7 +933,7 @@ bool TryApply(const GridView& gv) {
         Controls::ItemsControl::ItemContainerTransitionsProperty());
     gv.ItemContainerTransitions(Media::Animation::TransitionCollection{});
     HookPanel(gv, wrap);
-    Wh_Log(L"Applied, cell %.0fx%.0f", g_state.cellW, g_state.cellH);
+    Log(L"Applied, cell %.0fx%.0f", g_state.cellW, g_state.cellH);
     return true;
 }
 
@@ -990,7 +952,7 @@ void OnLayoutUpdated() {
         // Layout only writes what changed, so every pass is cheap.
         Layout(gv);
     } catch (...) {
-        Wh_Log(L"Error 0x%08X, restoring stock layout", winrt::to_hresult());
+        Log(L"Error 0x%08X, restoring stock layout", winrt::to_hresult());
         g_failed = true;
         Restore();
     }
@@ -1006,7 +968,7 @@ void OnPinnedListAdded(InstanceHandle handle, const GridView& gv) {
     g_state.layoutRevoker =
         gv.LayoutUpdated(winrt::auto_revoke, [](auto&&, auto&&) { OnLayoutUpdated(); });
     gv.InvalidateMeasure();
-    Wh_Log(L"Pinned list found");
+    Log(L"Pinned list found");
 }
 
 // ------------------------------------------------------- XAML diagnostics
@@ -1014,7 +976,35 @@ void OnPinnedListAdded(InstanceHandle handle, const GridView& gv) {
 winrt::com_ptr<IXamlDiagnostics> g_diag;
 winrt::com_ptr<IVisualTreeService3> g_vts;
 winrt::com_ptr<IVisualTreeServiceCallback2> g_callback;
-HANDLE g_initThread;
+std::atomic<bool> g_active{false};
+HANDLE g_activeMutex = nullptr;  // exists while a copy is active
+HANDLE g_adviseThread = nullptr;
+
+// Runs fn on Start's UI thread and waits for it. False if it didn't finish
+// in time.
+template <typename F>
+bool RunOnUi(F fn) {
+    auto dispatcher = GetDispatcher();
+    if (!dispatcher) {
+        return true;
+    }
+    try {
+        return dispatcher.RunAsync(wuc::CoreDispatcherPriority::Normal, fn)
+                   .wait_for(std::chrono::seconds(5)) == wf::AsyncStatus::Completed;
+    } catch (...) {
+        Log(L"Dispatch failed 0x%08X", winrt::to_hresult());
+        return false;
+    }
+}
+
+void OnSettingsChanged() {
+    LoadSettings();
+    RunOnUi(Guarded([] {
+        if (auto gv = g_state.view.get()) {
+            gv.InvalidateMeasure();
+        }
+    }));
+}
 
 struct Callback : winrt::implements<Callback, IVisualTreeServiceCallback2,
                                      winrt::non_agile> {
@@ -1044,13 +1034,11 @@ struct Callback : winrt::implements<Callback, IVisualTreeServiceCallback2,
                 return S_OK;
             }
             if (auto gv = insp.try_as<GridView>()) {
-                if (!g_dispatcher) {
-                    g_dispatcher = gv.Dispatcher();
-                }
+                SetDispatcherIfNone(gv.Dispatcher());
                 OnPinnedListAdded(element.Handle, gv);
             }
         } catch (...) {
-            Wh_Log(L"Tree callback error 0x%08X", winrt::to_hresult());
+            Log(L"Tree callback error 0x%08X", winrt::to_hresult());
         }
         return S_OK;
     }
@@ -1065,10 +1053,56 @@ struct Callback : winrt::implements<Callback, IVisualTreeServiceCallback2,
 DWORD WINAPI AdviseThread(void*) {
     auto cb = winrt::make_self<Callback>();
     HRESULT hr = g_vts->AdviseVisualTreeChange(cb.get());
-    Wh_Log(L"AdviseVisualTreeChange: 0x%08X", hr);
+    Log(L"AdviseVisualTreeChange: 0x%08X", hr);
     if (SUCCEEDED(hr)) {
         g_callback = cb;
     }
+    return 0;
+}
+
+// Waits for the disable event, then puts Start back as it was.
+DWORD WINAPI ControlThread(void*) {
+    HANDLE ev[2] = {CreateEventW(nullptr, TRUE, FALSE, kDisableEvent),
+                    CreateEventW(nullptr, FALSE, FALSE, kResetEvent)};
+    while (ev[0] && ev[1]) {
+        if (WaitForMultipleObjects(2, ev, FALSE, INFINITE) == WAIT_OBJECT_0) {
+            break;
+        }
+        Log(L"Reset layout");
+        RunOnUi(Guarded([] {
+            g_cells.clear();
+            g_state.known.clear();
+            g_state.pendingDrop.reset();
+            SaveCells();
+            Relayout();
+        }));
+    }
+    for (HANDLE h : ev) {
+        if (h) {
+            CloseHandle(h);
+        }
+    }
+    g_unloading = true;
+    if (g_adviseThread) {
+        WaitForSingleObject(g_adviseThread, INFINITE);
+        CloseHandle(g_adviseThread);
+        g_adviseThread = nullptr;
+    }
+    if (!RunOnUi([] { Restore(); })) {
+        Log(L"Restore didn't finish, waiting");
+        if (!RunOnUi([] { Restore(); })) {
+            Log(L"Restore still pending, giving up");
+        }
+    }
+    if (g_vts && g_callback) {
+        g_vts->UnadviseVisualTreeChange(g_callback.get());
+    }
+    g_callback = nullptr;
+    StopSettingsWatcher();
+    CloseHandle(g_activeMutex);
+    g_activeMutex = nullptr;
+    g_active = false;
+    Log(L"Disabled");
     return 0;
 }
 
@@ -1077,16 +1111,44 @@ struct Tap : winrt::implements<Tap, IObjectWithSite, winrt::non_agile> {
         if (!site) {
             return S_OK;
         }
+        if (g_active.exchange(true)) {
+            Log(L"Already active, ignoring SetSite");
+            return S_OK;
+        }
+        // One copy of the dll at a time: a newer install replaces the old one
+        // once that has disabled itself.
+        g_activeMutex = CreateMutexW(nullptr, FALSE, kActiveMutex);
+        if (!g_activeMutex || GetLastError() == ERROR_ALREADY_EXISTS) {
+            if (g_activeMutex) {
+                CloseHandle(g_activeMutex);
+                g_activeMutex = nullptr;
+            }
+            g_active = false;
+            Log(L"Another copy is active");
+            return S_OK;
+        }
+        g_unloading = false;
+        g_failed = false;
+        g_vts = nullptr;
+        g_diag = nullptr;
         site->QueryInterface(IID_PPV_ARGS(g_diag.put()));
         g_vts = g_diag ? g_diag.try_as<IVisualTreeService3>() : nullptr;
         if (!g_vts) {
-            Wh_Log(L"No IVisualTreeService3");
+            Log(L"No IVisualTreeService3");
+            CloseHandle(g_activeMutex);
+            g_activeMutex = nullptr;
+            g_active = false;
             return S_OK;
         }
+        LoadSettings();
+        LoadCells();
+        StartSettingsWatcher(OnSettingsChanged);
         // Advising from SetSite itself deadlocks.
-        if (HANDLE t = CreateThread(nullptr, 0, AdviseThread, nullptr, 0, nullptr)) {
+        g_adviseThread = CreateThread(nullptr, 0, AdviseThread, nullptr, 0, nullptr);
+        if (HANDLE t = CreateThread(nullptr, 0, ControlThread, nullptr, 0, nullptr)) {
             CloseHandle(t);
         }
+        Log(L"Activated");
         return S_OK;
     }
 
@@ -1109,95 +1171,26 @@ struct TapFactory : winrt::implements<TapFactory, IClassFactory> {
     HRESULT STDMETHODCALLTYPE LockServer(BOOL) override { return S_OK; }
 };
 
-DWORD WINAPI InitThread(void*) {
-    using InitFn = HRESULT(WINAPI*)(PCWSTR, DWORD, PCWSTR, PCWSTR, CLSID, PCWSTR);
-    // Pinned: XAML keeps a reference to the TAP after the mod is disabled.
-    HMODULE self = nullptr;
-    GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
-                           GET_MODULE_HANDLE_EX_FLAG_PIN,
-                       reinterpret_cast<LPCWSTR>(&InitThread), &self);
-    wchar_t selfPath[MAX_PATH];
-    GetModuleFileNameW(self, selfPath, MAX_PATH);
-
-    for (int i = 0; i < 60 && !g_unloading; ++i) {
-        HMODULE xaml = GetModuleHandleW(L"Windows.UI.Xaml.dll");
-        auto init = xaml ? reinterpret_cast<InitFn>(
-                               GetProcAddress(xaml, "InitializeXamlDiagnosticsEx"))
-                         : nullptr;
-        if (init) {
-            // ERROR_NOT_FOUND means "try the next connection name".
-            HRESULT hr = HRESULT_FROM_WIN32(ERROR_NOT_FOUND);
-            int n = 1;
-            for (; n <= 10000 && hr == HRESULT_FROM_WIN32(ERROR_NOT_FOUND); ++n) {
-                wchar_t name[64];
-                swprintf_s(name, L"VisualDiagConnection%d", n);
-                hr = init(name, GetCurrentProcessId(), L"", selfPath, CLSID_Tap,
-                          nullptr);
-            }
-            Wh_Log(L"InitializeXamlDiagnosticsEx: 0x%08X (connection %d)", hr,
-                   n - 1);
-            if (SUCCEEDED(hr)) {
-                return 0;
-            }
-        }
-        Sleep(1000);
-    }
-    return 0;
-}
-
-// Runs fn on Start's UI thread and waits for it.
-template <typename F>
-void RunOnUi(F fn) {
-    if (!g_dispatcher) {
-        return;
-    }
-    try {
-        g_dispatcher.RunAsync(wuc::CoreDispatcherPriority::Normal, fn)
-            .wait_for(std::chrono::seconds(5));
-    } catch (...) {
-        Wh_Log(L"Dispatch failed 0x%08X", winrt::to_hresult());
-    }
-}
-
 }  // namespace
 
-extern "C" __declspec(dllexport) HRESULT STDAPICALLTYPE
-DllGetClassObject(REFCLSID clsid, REFIID riid, void** ppv) {
+BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, void*) {
+    if (reason == DLL_PROCESS_ATTACH) {
+        // Pinned: XAML keeps a reference to the TAP after the tool is disabled.
+        HMODULE self = nullptr;
+        GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                               GET_MODULE_HANDLE_EX_FLAG_PIN,
+                           reinterpret_cast<LPCWSTR>(&DllMain), &self);
+    }
+    return TRUE;
+}
+
+STDAPI DllGetClassObject(REFCLSID clsid, REFIID riid, void** ppv) {
     if (clsid != CLSID_Tap) {
         return CLASS_E_CLASSNOTAVAILABLE;
     }
     return winrt::make<TapFactory>().as<IUnknown>()->QueryInterface(riid, ppv);
 }
 
-extern "C" __declspec(dllexport) HRESULT STDAPICALLTYPE DllCanUnloadNow() {
+STDAPI DllCanUnloadNow() {
     return S_FALSE;
-}
-
-BOOL Wh_ModInit() {
-    LoadSettings();
-    LoadCells();
-    g_initThread = CreateThread(nullptr, 0, InitThread, nullptr, 0, nullptr);
-    return TRUE;
-}
-
-void Wh_ModSettingsChanged() {
-    LoadSettings();
-    RunOnUi([] {
-        if (auto gv = g_state.view.get()) {
-            gv.InvalidateMeasure();
-        }
-    });
-}
-
-void Wh_ModUninit() {
-    g_unloading = true;
-    if (g_initThread) {
-        WaitForSingleObject(g_initThread, 5000);
-        CloseHandle(g_initThread);
-    }
-    RunOnUi([] { Restore(); });
-    if (g_vts && g_callback) {
-        g_vts->UnadviseVisualTreeChange(g_callback.get());
-    }
-    g_callback = nullptr;
 }

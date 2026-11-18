@@ -1,0 +1,68 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Version
+        id: ver
+        shell: pwsh
+        run: |
+          $ver = '${{ github.ref_name }}' -replace '^v', ''
+          $h = Get-Content src/common/version.h -Raw
+          $cur = [regex]::Match($h, 'STARTGRID_VERSION_TEXT "([^"]+)"').Groups[1].Value
+          if ($cur -ne $ver) { throw "tag $ver does not match version.h $cur" }
+          "version=$ver" >> $env:GITHUB_OUTPUT
+
+      - name: Notes
+        shell: pwsh
+        run: |
+          $ver = '${{ steps.ver.outputs.version }}'
+          $text = Get-Content CHANGELOG.md -Raw
+          $m = [regex]::Match($text, "(?ms)^## \[$([regex]::Escape($ver))\][^\r\n]*\r?\n(.*?)(?=^## \[|\z)")
+          if (-not $m.Success -or -not $m.Groups[1].Value.Trim()) { throw "no CHANGELOG section for $ver" }
+          $m.Groups[1].Value.Trim() | Set-Content notes.md
+
+      - name: Inno Setup
+        shell: pwsh
+        run: |
+          if (-not (Test-Path 'C:\Program Files (x86)\Inno Setup 6\ISCC.exe')) {
+            choco install innosetup -y --no-progress
+          }
+      - name: Build
+        shell: pwsh
+        run: ./build.ps1 -Version '${{ steps.ver.outputs.version }}' -Installer
+
+      - name: Package
+        shell: pwsh
+        run: |
+          $ver = '${{ steps.ver.outputs.version }}'
+          $zip = "build/StartMenu-FreeGrid-$ver-portable.zip"
+          Compress-Archive -Path build/StartGrid.exe, build/StartGrid.dll, README.md, LICENSE -DestinationPath $zip
+          $setup = "build/StartMenu-FreeGrid-Setup-$ver.exe"
+          if (-not (Test-Path $setup)) { throw 'installer missing' }
+          Get-FileHash $setup, $zip -Algorithm SHA256 |
+            ForEach-Object { '{0}  {1}' -f $_.Hash.ToLower(), (Split-Path $_.Path -Leaf) } |
+            Set-Content build/SHA256SUMS.txt
+
+      - name: Publish
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $ver = '${{ steps.ver.outputs.version }}'
+          gh release create '${{ github.ref_name }}' `
+            "build/StartMenu-FreeGrid-Setup-$ver.exe" `
+            "build/StartMenu-FreeGrid-$ver-portable.zip" `
+            build/SHA256SUMS.txt `
+            --title "StartMenu FreeGrid $ver" `
+            --notes-file notes.md

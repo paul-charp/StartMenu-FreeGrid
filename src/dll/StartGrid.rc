@@ -1,0 +1,32 @@
+#include <windows.h>
+
+#include "../common/version.h"
+
+VS_VERSION_INFO VERSIONINFO
+FILEVERSION STARTGRID_VER_MAJOR, STARTGRID_VER_MINOR, STARTGRID_VER_PATCH, 0
+PRODUCTVERSION STARTGRID_VER_MAJOR, STARTGRID_VER_MINOR, STARTGRID_VER_PATCH, 0
+FILEFLAGSMASK VS_FFI_FILEFLAGSMASK
+FILEFLAGS 0
+FILEOS VOS_NT_WINDOWS32
+FILETYPE VFT_DLL
+FILESUBTYPE VFT2_UNKNOWN
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "040904B0"
+        BEGIN
+            VALUE "CompanyName", "paul-charp"
+            VALUE "FileDescription", "StartMenu FreeGrid Start menu extension"
+            VALUE "FileVersion", STARTGRID_VERSION_TEXT
+            VALUE "InternalName", "StartGrid"
+            VALUE "LegalCopyright", "2026 paul-charp"
+            VALUE "OriginalFilename", "StartGrid.dll"
+            VALUE "ProductName", "StartMenu FreeGrid"
+            VALUE "ProductVersion", STARTGRID_VERSION_TEXT
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x0409, 1200
+    END
+END
