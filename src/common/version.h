@@ -6,8 +6,8 @@
 #include "version_override.h"
 #else
 #define STARTGRID_VER_MAJOR 0
-#define STARTGRID_VER_MINOR 1
+#define STARTGRID_VER_MINOR 2
 #define STARTGRID_VER_PATCH 0
-#define STARTGRID_VERSION_TEXT "0.1.0"
-#define STARTGRID_VERSION_STR L"0.1.0"
+#define STARTGRID_VERSION_TEXT "0.2.0"
+#define STARTGRID_VERSION_STR L"0.2.0"
 #endif

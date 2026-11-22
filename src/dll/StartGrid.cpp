@@ -23,6 +23,7 @@
 #include <atomic>
 #include <chrono>
 #include <cmath>
+#include <functional>
 #include <map>
 #include <mutex>
 #include <optional>
@@ -40,12 +41,19 @@ namespace {
 constexpr wchar_t kPinnedType[] = L"Windows.UI.Xaml.Controls.GridView";
 constexpr wchar_t kPinnedName[] = L"PinnedList";
 constexpr ULONGLONG kPendingDropMs = 5000;
+constexpr ULONGLONG kPreviewHoldMs = 1500;  // external drop, until its tile shows
+constexpr int kMoveMs = 450;    // tile slide
+constexpr int kHideMs = 150;    // dragged tile fading out
+constexpr int kRevealMs = 300;  // dragged tile back after the drag
+constexpr int kDwellMs = 120;   // pointer rests in a cell before tiles move
+constexpr float kEnterOffset = 16;  // new tiles slide up from here
 
 // ---------------------------------------------------------------- settings
 
 struct Settings {
     int columns = 0;
     int rows = 0;
+    bool probe = false;  // [grid] probe=1: log GridView drag events and tile states
 };
 
 std::mutex g_settingsLock;
@@ -55,6 +63,7 @@ void LoadSettings() {
     Settings s;
     s.columns = GetGridInt(L"columns");
     s.rows = GetGridInt(L"rows");
+    s.probe = GetGridInt(L"probe") != 0;
     std::lock_guard lock(g_settingsLock);
     g_settings = s;
 }
@@ -114,6 +123,18 @@ struct Known {
     std::wstring key;
 };
 
+// A tile's drawn position, in panel coordinates. The CompositeTransform's
+// base value is always the final one; a Storyboard slides to it.
+struct TileAnim {
+    winrt::weak_ref<GridViewItem> container;
+    wf::Point slot{};
+    wf::Point from{};
+    wf::Point to{};
+    double start = 0;  // ms, 0 = at rest
+    Media::Animation::Storyboard move{nullptr};
+    Media::Animation::Storyboard fade{nullptr};
+};
+
 // Everything below is touched on Start's UI thread only.
 struct State {
     InstanceHandle handle = 0;
@@ -149,12 +170,38 @@ struct State {
     // order until shortly after it ends.
     ULONGLONG ignoreOrderUntil = 0;
     ULONGLONG externalLogTime = 0;
+    std::wstring dragKey;
+    std::wstring snapKey;  // placed without sliding on the next pass
+
+
+    // Live drag preview: tiles pushed aside, not saved until the drop.
+    std::map<std::wstring, TileAnim> anims;
+    std::map<std::wstring, Cell> preview;
+    std::optional<Cell> previewCell;
+    bool previewExternal = false;
+    DispatcherTimer previewTimer{nullptr};
+    DispatcherTimer::Tick_revoker previewTimerRevoker;
+    // Cell the pointer just entered, previewed once it rests there.
+    std::optional<Cell> pendingCell;
+    std::wstring pendingMoving;
+    DispatcherTimer dwellTimer{nullptr};
+    DispatcherTimer::Tick_revoker dwellTimerRevoker;
+
+    // Probe mode: drops onto a tile's centre are left to Start and logged.
+    std::optional<Cell> probeCell;
+    std::optional<Cell> probeLogCell;
+    std::map<std::wstring, std::wstring> probeStates;
+    bool probeListed = false;
+    wf::IInspectable probeEnterHandler{nullptr};
+    wf::IInspectable probeOverHandler{nullptr};
+    wf::IInspectable probeDropHandler{nullptr};
 
     FrameworkElement::LayoutUpdated_revoker layoutRevoker;
     Controls::ListViewBase::DragItemsStarting_revoker dragStartRevoker;
     Controls::ListViewBase::DragItemsCompleted_revoker dragEndRevoker;
     UIElement::DragOver_revoker panelDragOverRevoker;
     UIElement::Drop_revoker panelDropRevoker;
+    UIElement::DragLeave_revoker panelDragLeaveRevoker;
     winrt::weak_ref<UIElement> dragRoot;
     wf::IInspectable dragOverHandler{nullptr};
     wf::IInspectable dragLeaveHandler{nullptr};
@@ -169,6 +216,7 @@ std::atomic<bool> g_unloading{false};
 std::atomic<bool> g_failed{false};  // after an error, stay out until Start restarts
 
 void Layout(const GridView& gv);
+void Relayout();
 std::optional<Cell> CursorCell();
 
 wuc::CoreDispatcher GetDispatcher() {
@@ -241,6 +289,332 @@ void MoveTo(const std::wstring& key, Cell target) {
     SaveCells();
     Log(L"Moved %s to row %d, column %d%s", key.c_str(), target.row,
         target.col, other.empty() ? L"" : L" (swapped)");
+}
+
+// ------------------------------------------------------------- push to gap
+
+// Cells of the tiles on screen, by index, without except.
+std::map<int, std::wstring> KnownOccupancy(const std::wstring& except) {
+    std::map<int, std::wstring> occ;
+    for (auto& k : g_state.known) {
+        if (k.key == except) {
+            continue;
+        }
+        auto it = g_cells.find(k.key);
+        if (it != g_cells.end() && it->second.row >= 0 && it->second.col >= 0 &&
+            it->second.col < g_state.cols) {
+            occ[Index(it->second)] = k.key;
+        }
+    }
+    return occ;
+}
+
+// Moves that free cell ci: the run of tiles from ci shifts one cell toward
+// the dragged tile's origin when the run reaches it (like the native
+// insert), else forward up to the first gap. Gaps further on stay.
+std::map<std::wstring, Cell> PushPlan(const std::map<int, std::wstring>& occ,
+                                      int ci,
+                                      int origin) {
+    std::map<std::wstring, Cell> moves;
+    if (!occ.count(ci)) {
+        return moves;
+    }
+    if (origin >= 0 && origin < ci) {
+        bool run = true;
+        for (int i = origin + 1; i <= ci && run; ++i) {
+            run = occ.count(i) > 0;
+        }
+        if (run) {
+            for (int i = origin + 1; i <= ci; ++i) {
+                moves[occ.at(i)] = FromIndex(i - 1);
+            }
+            return moves;
+        }
+    }
+    int j = ci;
+    while (occ.count(j)) {
+        ++j;
+    }
+    for (int i = ci; i < j; ++i) {
+        moves[occ.at(i)] = FromIndex(i + 1);
+    }
+    return moves;
+}
+
+// Shows the grid as it would be with moving (or a new tile) dropped at cell.
+void SetPreview(Cell cell, const std::wstring& moving) {
+    if (g_state.previewCell == cell) {
+        return;
+    }
+    g_state.previewCell = cell;
+    int origin = -1;
+    if (auto it = g_cells.find(moving); !moving.empty() && it != g_cells.end()) {
+        origin = Index(it->second);
+    }
+    g_state.preview = PushPlan(KnownOccupancy(moving), Index(cell), origin);
+    if (!moving.empty()) {
+        g_state.preview[moving] = cell;
+    }
+    Relayout();
+}
+
+// Previews cell once the pointer has rested in it for kDwellMs, so crossing
+// cells or wobbling on a border doesn't shuffle tiles back and forth.
+void RequestPreview(Cell cell, const std::wstring& moving) {
+    if (g_state.previewCell == cell) {
+        g_state.pendingCell.reset();
+        if (g_state.dwellTimer) {
+            g_state.dwellTimer.Stop();
+        }
+        return;
+    }
+    if (g_state.pendingCell == cell) {
+        return;  // already waiting for this one
+    }
+    g_state.pendingCell = cell;
+    g_state.pendingMoving = moving;
+    if (!g_state.dwellTimer) {
+        DispatcherTimer t;
+        t.Interval(std::chrono::milliseconds(kDwellMs));
+        g_state.dwellTimerRevoker = t.Tick(winrt::auto_revoke, [](auto&&, auto&&) {
+            try {
+                g_state.dwellTimer.Stop();
+                if (auto c = g_state.pendingCell) {
+                    g_state.pendingCell.reset();
+                    SetPreview(*c, g_state.pendingMoving);
+                }
+            } catch (...) {
+                Log(L"Dwell timer error 0x%08X", winrt::to_hresult());
+            }
+        });
+        g_state.dwellTimer = t;
+    }
+    g_state.dwellTimer.Stop();
+    g_state.dwellTimer.Start();
+}
+
+void ClearPreview(bool relayout = true) {
+    g_state.pendingCell.reset();
+    if (g_state.dwellTimer) {
+        g_state.dwellTimer.Stop();
+    }
+    if (g_state.previewTimer) {
+        g_state.previewTimer.Stop();
+    }
+    g_state.previewExternal = false;
+    if (!g_state.previewCell) {
+        return;
+    }
+    g_state.previewCell.reset();
+    g_state.preview.clear();
+    if (relayout) {
+        Relayout();
+    }
+}
+
+// An external drop keeps its preview until the new tile shows up, or not.
+void HoldExternalPreview() {
+    if (!g_state.previewTimer) {
+        DispatcherTimer t;
+        t.Interval(std::chrono::milliseconds(kPreviewHoldMs));
+        g_state.previewTimerRevoker = t.Tick(winrt::auto_revoke, [](auto&&, auto&&) {
+            try {
+                g_state.previewTimer.Stop();
+                if (g_state.previewExternal) {
+                    ClearPreview();
+                }
+            } catch (...) {
+                Log(L"Preview timer error 0x%08X", winrt::to_hresult());
+            }
+        });
+        g_state.previewTimer = t;
+    }
+    g_state.previewTimer.Start();
+}
+
+// --------------------------------------------------------------- animation
+
+namespace An = Media::Animation;
+
+bool Near(wf::Point a, wf::Point b) {
+    return std::fabs(a.X - b.X) < 0.5f && std::fabs(a.Y - b.Y) < 0.5f;
+}
+
+Duration Ms(int ms) {
+    return DurationHelper::FromTimeSpan(wf::TimeSpan{std::chrono::milliseconds(ms)});
+}
+
+double NowMs() {
+    using namespace std::chrono;
+    return duration<double, std::milli>(steady_clock::now().time_since_epoch()).count();
+}
+
+An::EasingFunctionBase EaseOut() {
+    An::CubicEase ease;
+    ease.EasingMode(An::EasingMode::EaseOut);
+    return ease;
+}
+
+// Same curve as EaseOut(): a slide retargeted mid-way starts from where the
+// tile is drawn.
+wf::Point CurrentPos(const TileAnim& a) {
+    if (!a.start) {
+        return a.to;
+    }
+    double p = (NowMs() - a.start) / kMoveMs;
+    if (p >= 1) {
+        return a.to;
+    }
+    double k = 1 - std::pow(1 - p, 3);
+    return {float(a.from.X + (a.to.X - a.from.X) * k),
+            float(a.from.Y + (a.to.Y - a.from.Y) * k)};
+}
+
+void StopAnim(TileAnim& a) {
+    if (a.move) {
+        a.move.Stop();
+        a.move = nullptr;
+    }
+    if (a.fade) {
+        a.fade.Stop();
+        a.fade = nullptr;
+    }
+}
+
+void Snap(TileAnim& a, const Media::CompositeTransform& t, wf::Point to, wf::Point slot) {
+    if (a.move) {
+        a.move.Stop();
+        a.move = nullptr;
+    }
+    a.from = a.to = to;
+    a.slot = slot;
+    a.start = 0;
+    t.TranslateX(to.X - slot.X);
+    t.TranslateY(to.Y - slot.Y);
+}
+
+void AddAnim(const An::Storyboard& sb,
+             const DependencyObject& target,
+             const wchar_t* prop,
+             std::optional<double> from,
+             double to,
+             int ms,
+             bool ease = true) {
+    An::DoubleAnimation da;
+    if (from) {
+        da.From(*from);
+    }
+    da.To(to);
+    da.Duration(Ms(ms));
+    if (ease) {
+        da.EasingFunction(EaseOut());
+    }
+    An::Storyboard::SetTarget(da, target);
+    An::Storyboard::SetTargetProperty(da, prop);
+    sb.Children().Append(da);
+}
+
+void Slide(TileAnim& a,
+           const Media::CompositeTransform& t,
+           wf::Point from,
+           wf::Point to,
+           wf::Point slot) {
+    if (a.move) {
+        a.move.Stop();
+    }
+    a.from = from;
+    a.to = to;
+    a.slot = slot;
+    a.start = NowMs();
+    t.TranslateX(to.X - slot.X);
+    t.TranslateY(to.Y - slot.Y);
+    An::Storyboard sb;
+    if (std::fabs(from.X - to.X) >= 0.5f) {
+        AddAnim(sb, t, L"TranslateX", from.X - slot.X, to.X - slot.X, kMoveMs);
+    }
+    if (std::fabs(from.Y - to.Y) >= 0.5f) {
+        AddAnim(sb, t, L"TranslateY", from.Y - slot.Y, to.Y - slot.Y, kMoveMs);
+    }
+    sb.Begin();
+    a.move = sb;
+}
+
+// Opacity, and optionally a scale-in from scaleFrom, held at the end until
+// stopped (then back to 1).
+void Fade(TileAnim& a,
+          const UIElement& c,
+          std::optional<double> from,
+          double to,
+          int ms,
+          std::optional<double> scaleFrom = std::nullopt) {
+    if (a.fade) {
+        a.fade.Stop();
+    }
+    An::Storyboard sb;
+    AddAnim(sb, c, L"Opacity", from, to, ms, false);
+    auto t = c.RenderTransform().try_as<Media::CompositeTransform>();
+    auto fe = c.try_as<FrameworkElement>();
+    if (scaleFrom && t && fe) {
+        t.CenterX(fe.ActualWidth() / 2);
+        t.CenterY(fe.ActualHeight() / 2);
+        AddAnim(sb, t, L"ScaleX", *scaleFrom, 1.0, ms);
+        AddAnim(sb, t, L"ScaleY", *scaleFrom, 1.0, ms);
+    }
+    sb.Begin();
+    a.fade = sb;
+}
+
+// Puts a tile at cell, sliding from where it is drawn now. Native slot
+// changes (Start reordering its list) don't move it on screen.
+void PlaceTile(const std::wstring& key, const GridViewItem& c, Cell cell, bool appeared) {
+    wf::Point to{float(cell.col * g_state.cellW), float(cell.row * g_state.cellH)};
+    auto r = Controls::Primitives::LayoutInformation::GetLayoutSlot(c);
+    wf::Point slot{r.X, r.Y};
+    auto t = c.RenderTransform().try_as<Media::CompositeTransform>();
+    if (!t) {
+        t = Media::CompositeTransform{};
+        c.RenderTransform(t);
+    }
+    auto it = g_state.anims.find(key);
+    if (it == g_state.anims.end() || it->second.container.get() != c) {
+        auto& a = g_state.anims[key];
+        StopAnim(a);
+        a = TileAnim{};
+        a.container = winrt::make_weak(c);
+        if (appeared) {
+            Slide(a, t, {to.X, to.Y + kEnterOffset}, to, slot);
+            Fade(a, c, 0.0, 1.0, kMoveMs, 0.9);
+        } else {
+            Snap(a, t, to, slot);
+        }
+        return;
+    }
+    auto& a = it->second;
+    bool same = Near(a.to, to) && Near(a.slot, slot);
+    if (key == g_state.dragKey || key == g_state.snapKey) {
+        if (!same || a.start) {
+            Snap(a, t, to, slot);
+        }
+        return;
+    }
+    if (same) {
+        // Start may reset the transform. Only checked at rest: mid-slide the
+        // property reads back the animated value.
+        if (a.start && NowMs() - a.start < kMoveMs + 50) {
+            return;
+        }
+        if (std::fabs(t.TranslateX() - (to.X - slot.X)) > 0.01 ||
+            std::fabs(t.TranslateY() - (to.Y - slot.Y)) > 0.01) {
+            Snap(a, t, to, slot);
+        }
+        return;
+    }
+    wf::Point cur = CurrentPos(a);
+    if (Near(cur, to)) {
+        Snap(a, t, to, slot);
+    } else {
+        Slide(a, t, cur, to, slot);
+    }
 }
 
 // --------------------------------------------------------------- highlight
@@ -360,6 +734,15 @@ void Restore() {
     g_state.dragEndRevoker.revoke();
     if (g_state.applied) {
         try {
+            if (g_state.previewTimer) {
+                g_state.previewTimer.Stop();
+            }
+            if (g_state.dwellTimer) {
+                g_state.dwellTimer.Stop();
+            }
+            for (auto& [key, a] : g_state.anims) {
+                StopAnim(a);
+            }
             RemoveHighlight();
             if (auto gv = g_state.view.get()) {
                 auto unhook = [&](const RoutedEvent& ev, const wf::IInspectable& h) {
@@ -368,6 +751,9 @@ void Restore() {
                     }
                 };
                 unhook(UIElement::RightTappedEvent(), g_state.rightTappedHandler);
+                unhook(UIElement::DragEnterEvent(), g_state.probeEnterHandler);
+                unhook(UIElement::DragOverEvent(), g_state.probeOverHandler);
+                unhook(UIElement::DropEvent(), g_state.probeDropHandler);
                 if (auto root = g_state.dragRoot.get()) {
                     if (g_state.dragOverHandler) {
                         root.RemoveHandler(UIElement::DragOverEvent(), g_state.dragOverHandler);
@@ -602,13 +988,40 @@ void Layout(const GridView& gv) {
         dropCell = CursorCell();
         dropWhy = L"under cursor";
     }
-    if (dropCell && dropCell->col < cols && !isUsed(Index(*dropCell))) {
+    if (dropCell && dropCell->col < cols) {
         for (size_t i = 0; i < entries.size(); ++i) {
-            if (entries[i].cell < 0) {
-                place(i, Index(*dropCell), dropWhy);
-                g_state.pendingDrop.reset();
-                break;
+            if (entries[i].cell >= 0) {
+                continue;
             }
+            int ci = Index(*dropCell);
+            if (isUsed(ci)) {
+                // Make room: same push as the drag preview showed.
+                std::map<int, std::wstring> occ;
+                for (auto& e : entries) {
+                    if (e.cell >= 0) {
+                        occ[e.cell] = e.key;
+                    }
+                }
+                auto moves = PushPlan(occ, ci, -1);
+                for (auto& e : entries) {
+                    if (auto m = moves.find(e.key); m != moves.end()) {
+                        e.cell = Index(m->second);
+                        g_cells[e.key] = m->second;
+                        changed = true;
+                    }
+                }
+                used.assign(used.size(), false);
+                for (auto& e : entries) {
+                    if (e.cell >= 0) {
+                        take(e.cell);
+                    }
+                }
+                Log(L"Pushed %zu tiles for the drop", moves.size());
+            }
+            place(i, ci, dropWhy);
+            g_state.pendingDrop.reset();
+            ClearPreview(false);
+            break;
         }
     }
 
@@ -632,27 +1045,33 @@ void Layout(const GridView& gv) {
         SaveCells();
     }
 
-    // Shift each tile from its native slot to its cell. RenderTransform
-    // doesn't trigger layout.
+    // Shift each tile from its native slot to its cell (or its preview
+    // cell during a drag). RenderTransform doesn't trigger layout.
+    bool initial = g_state.known.empty();
+    int last = int(used.size()) - 1;
     for (auto& e : entries) {
         Cell cell = FromIndex(e.cell);
-        auto slot = Controls::Primitives::LayoutInformation::GetLayoutSlot(e.container);
-        double dx = cell.col * g_state.cellW - slot.X;
-        double dy = cell.row * g_state.cellH - slot.Y;
-        auto t = e.container.RenderTransform().try_as<Media::TranslateTransform>();
-        if (!t) {
-            t = Media::TranslateTransform{};
-            e.container.RenderTransform(t);
+        if (auto p = g_state.preview.find(e.key); p != g_state.preview.end()) {
+            cell = p->second;
+            last = std::max(last, Index(cell));
         }
-        if (t.X() != dx || t.Y() != dy) {
-            t.X(dx);
-            t.Y(dy);
+        PlaceTile(e.key, e.container, cell, !initial && !wasShown(e.key));
+    }
+    for (auto it = g_state.anims.begin(); it != g_state.anims.end();) {
+        bool present = std::any_of(entries.begin(), entries.end(),
+                                   [&](auto& e) { return e.key == it->first; });
+        if (present) {
+            ++it;
+        } else {
+            StopAnim(it->second);
+            it = g_state.anims.erase(it);
         }
     }
 
     // One spare row while dragging, so tiles can go below the last one.
-    int rows = std::max(s.rows, int(used.size() + cols - 1) / cols);
-    rows = std::max(rows, 1) + (g_state.dragItem ? 1 : 0);
+    int rows = std::max(s.rows, (last + cols) / cols);
+    rows = std::max(rows, 1) +
+           (g_state.dragItem || g_state.previewExternal ? 1 : 0);
     double height = rows * g_state.cellH;
     if (g_state.height != height) {
         g_state.height = height;
@@ -737,6 +1156,147 @@ auto Guarded(F fn) {
     };
 }
 
+// ------------------------------------------------------------------- probe
+
+std::wstring Describe(const wf::IInspectable& o) {
+    if (!o) {
+        return L"null";
+    }
+    std::wstring d(winrt::get_class_name(o));
+    if (auto fe = o.try_as<FrameworkElement>(); fe && !fe.Name().empty()) {
+        d += L"#" + std::wstring(fe.Name());
+    }
+    return d;
+}
+
+DependencyObject FindDesc(const DependencyObject& root,
+                          const std::function<bool(const DependencyObject&)>& pred,
+                          int depth = 10) {
+    if (!root || depth < 0) {
+        return nullptr;
+    }
+    int n = Media::VisualTreeHelper::GetChildrenCount(root);
+    for (int i = 0; i < n; ++i) {
+        auto c = Media::VisualTreeHelper::GetChild(root, i);
+        if (pred(c)) {
+            return c;
+        }
+        if (auto r = FindDesc(c, pred, depth - 1)) {
+            return r;
+        }
+    }
+    return nullptr;
+}
+
+FrameworkElement FirstChild(const DependencyObject& d) {
+    if (!d || Media::VisualTreeHelper::GetChildrenCount(d) == 0) {
+        return nullptr;
+    }
+    return Media::VisualTreeHelper::GetChild(d, 0).try_as<FrameworkElement>();
+}
+
+// Logs every tile's visual states when they change (all state names once).
+void ProbeDump() {
+    auto gv = g_state.view.get();
+    if (!gv) {
+        return;
+    }
+    auto items = gv.Items();
+    for (uint32_t i = 0; i < items.Size(); ++i) {
+        auto c = gv.ContainerFromIndex(i).try_as<GridViewItem>();
+        if (!c) {
+            continue;
+        }
+        std::vector<FrameworkElement> roots;
+        if (auto r = FirstChild(c)) {
+            roots.push_back(r);
+        }
+        auto tile = FindDesc(c, [](auto& d) {
+                        return winrt::get_class_name(d) == L"StartMenu.PinnedListTile";
+                    }).try_as<FrameworkElement>();
+        if (tile) {
+            roots.push_back(tile);
+            if (auto r = FirstChild(tile)) {
+                roots.push_back(r);
+            }
+        }
+        std::wstring text;
+        for (auto& r : roots) {
+            for (auto g : VisualStateManager::GetVisualStateGroups(r)) {
+                auto cur = g.CurrentState();
+                text += std::wstring(g.Name()) + L"=" +
+                        (cur ? std::wstring(cur.Name()) : std::wstring(L"-")) + L" ";
+                if (!g_state.probeListed) {
+                    std::wstring all;
+                    for (auto st : g.States()) {
+                        all += std::wstring(st.Name()) + L" ";
+                    }
+                    Log(L"Probe states on %s, group %s: %s", Describe(r).c_str(),
+                        g.Name().c_str(), all.c_str());
+                }
+            }
+        }
+        g_state.probeListed = true;
+        auto plate = FindDesc(c, [](auto& d) {
+                         auto fe = d.try_as<FrameworkElement>();
+                         return fe && fe.Name() == L"FolderHintPlate";
+                     }).try_as<UIElement>();
+        if (plate) {
+            wchar_t buf[64];
+            swprintf_s(buf, L"plate=%s/%.2f",
+                       plate.Visibility() == Visibility::Visible ? L"vis" : L"col",
+                       plate.Opacity());
+            text += buf;
+        }
+        std::wstring key = KeyOf(c);
+        if (g_state.probeStates[key] != text) {
+            g_state.probeStates[key] = text;
+            Log(L"Probe %s: %s", key.c_str(), text.c_str());
+        }
+    }
+}
+
+// After Start's own handlers have run.
+void ProbeDumpLater() {
+    if (auto d = GetDispatcher()) {
+        d.RunAsync(wuc::CoreDispatcherPriority::Low, Guarded([] { ProbeDump(); }));
+    }
+}
+
+void ProbeLog(const wchar_t* what, DragEventArgs const& e) {
+    Log(L"Probe %s on GridView: source %s, handled %d, operation %d", what,
+        Describe(e.OriginalSource()).c_str(), int(e.Handled()),
+        int(e.AcceptedOperation()));
+}
+
+void HookProbe(const GridView& gv) {
+    using DragArgs = DragEventArgs const&;
+    g_state.probeEnterHandler = winrt::box_value(DragEventHandler(
+        Guarded([](auto&&, DragArgs e) {
+            if (g_state.dragItem && CurrentSettings().probe) {
+                ProbeLog(L"DragEnter", e);
+            }
+        })));
+    g_state.probeOverHandler = winrt::box_value(DragEventHandler(
+        Guarded([](auto&&, DragArgs e) {
+            if (g_state.dragItem && CurrentSettings().probe &&
+                g_state.probeLogCell != g_state.probeCell) {
+                g_state.probeLogCell = g_state.probeCell;
+                ProbeLog(L"DragOver", e);
+            }
+        })));
+    g_state.probeDropHandler = winrt::box_value(DragEventHandler(
+        Guarded([](auto&&, DragArgs e) {
+            if (g_state.dragItem && CurrentSettings().probe) {
+                ProbeLog(L"Drop", e);
+                ProbeDumpLater();
+            }
+        })));
+    gv.AddHandler(UIElement::DragEnterEvent(), g_state.probeEnterHandler, true);
+    gv.AddHandler(UIElement::DragOverEvent(), g_state.probeOverHandler, true);
+    gv.AddHandler(UIElement::DropEvent(), g_state.probeDropHandler, true);
+}
+
 void HookPanel(const GridView& gv, const Controls::Panel& panel) {
     g_state.panel = winrt::make_weak(panel);
     g_state.origPanelBackground = panel.ReadLocalValue(Controls::Panel::BackgroundProperty());
@@ -749,9 +1309,9 @@ void HookPanel(const GridView& gv, const Controls::Panel& panel) {
     using DragArgs = DragEventArgs const&;
 
     // Drags from inside the grid: handled on the panel, before Start's own
-    // drag code sees them, with native reorder off. Start computes drop
-    // targets from its untransformed layout, so it can't be trusted with
-    // drops onto folders either: folders are managed from the context menu.
+    // drag code sees them, with native reorder off. Start targets the item at
+    // the native slot under the pointer, so drops onto folders can't be left
+    // to it either: folders are managed from the context menu.
     g_state.panelDragOverRevoker = panel.DragOver(
         winrt::auto_revoke, Guarded([](auto&&, DragArgs e) {
             auto p = g_state.panel.get();
@@ -759,10 +1319,23 @@ void HookPanel(const GridView& gv, const Controls::Panel& panel) {
                 return;
             }
             Cell cell = CellAt(e.GetPosition(p));
+            g_state.probeCell = cell;
             e.AcceptedOperation(
                 winrt::Windows::ApplicationModel::DataTransfer::DataPackageOperation::Move);
             ShowHighlight(cell);
+            if (!g_state.dragKey.empty()) {
+                RequestPreview(cell, g_state.dragKey);
+            }
             e.Handled(true);
+        }));
+    g_state.panelDragLeaveRevoker = panel.DragLeave(
+        winrt::auto_revoke, Guarded([](auto&&, DragArgs e) {
+            // Also raised moving between tiles: only leaving the grid counts.
+            if (!g_state.dragItem || CellIfInside(e)) {
+                return;
+            }
+            HideHighlight();
+            ClearPreview();
         }));
     g_state.panelDropRevoker = panel.Drop(
         winrt::auto_revoke, Guarded([](auto&&, DragArgs e) {
@@ -770,13 +1343,20 @@ void HookPanel(const GridView& gv, const Controls::Panel& panel) {
             if (!p || !g_state.dragItem) {
                 return;
             }
-            HideHighlight();
             Cell cell = CellAt(e.GetPosition(p));
-            std::wstring key = KeyOfItem(g_state.dragItem);
+            HideHighlight();
+            std::wstring key = g_state.dragKey;
             g_state.ignoreOrderUntil = GetTickCount64() + 1500;
-            if (!key.empty()) {
-                MoveTo(key, cell);
+            if (!key.empty() && g_cells.count(key)) {
+                SetPreview(cell, key);
+                for (auto& [k, c] : g_state.preview) {
+                    g_cells[k] = c;
+                }
+                SaveCells();
+                Log(L"Moved %s to row %d, column %d (%zu pushed)", key.c_str(),
+                    cell.row, cell.col, g_state.preview.size() - 1);
             }
+            ClearPreview(false);
             e.Handled(true);
             Relayout();
         }));
@@ -793,8 +1373,13 @@ void HookPanel(const GridView& gv, const Controls::Panel& panel) {
             auto cell = CellIfInside(e);
             if (cell) {
                 ShowHighlight(*cell);
+                g_state.previewExternal = true;
+                RequestPreview(*cell, L"");
             } else {
                 HideHighlight();
+                if (g_state.previewExternal) {
+                    ClearPreview();
+                }
             }
             if (cell && GetTickCount64() - g_state.externalLogTime > 1000) {
                 g_state.externalLogTime = GetTickCount64();
@@ -802,7 +1387,15 @@ void HookPanel(const GridView& gv, const Controls::Panel& panel) {
             }
         })));
     g_state.dragLeaveHandler = winrt::box_value(DragEventHandler(
-        Guarded([](auto&&, DragArgs) { HideHighlight(); })));
+        Guarded([](auto&&, DragArgs e) {
+            if (g_state.dragItem || CellIfInside(e)) {
+                return;
+            }
+            HideHighlight();
+            if (g_state.previewExternal) {
+                ClearPreview();
+            }
+        })));
     g_state.dropHandler = winrt::box_value(DragEventHandler(
         Guarded([](auto&&, DragArgs e) {
             if (g_state.dragItem) {
@@ -813,7 +1406,13 @@ void HookPanel(const GridView& gv, const Controls::Panel& panel) {
                 g_state.pendingDrop = *cell;
                 g_state.pendingDropTime = GetTickCount64();
                 Log(L"External drop at row %d, column %d", cell->row, cell->col);
+                if (g_state.previewExternal) {
+                    HoldExternalPreview();
+                }
             } else {
+                if (g_state.previewExternal) {
+                    ClearPreview();
+                }
                 auto pt = g_state.panel.get() ? e.GetPosition(g_state.panel.get())
                                               : wf::Point{};
                 Log(L"External drop outside the grid (%.0f, %.0f)", pt.X, pt.Y);
@@ -835,15 +1434,28 @@ void HookPanel(const GridView& gv, const Controls::Panel& panel) {
         Guarded([](auto&&, Controls::DragItemsStartingEventArgs const& a) {
             if (a.Items().Size() > 0) {
                 g_state.dragItem = a.Items().GetAt(0);
-                Log(L"Drag started: %s", KeyOfItem(g_state.dragItem).c_str());
+                g_state.dragKey = KeyOfItem(g_state.dragItem);
+                ClearPreview(false);
+                Log(L"Drag started: %s", g_state.dragKey.c_str());
                 // Changing CanReorderItems inside DragItemsStarting cancels
-                // the drag: switch it once the drag is running.
+                // the drag: switch it once the drag is running. The tile
+                // hides then too (the drag visual is already captured).
                 if (auto dispatcher = GetDispatcher()) {
                     dispatcher.RunAsync(
                         wuc::CoreDispatcherPriority::Low, Guarded([] {
-                            if (auto gv = g_state.view.get(); gv && g_state.dragItem) {
-                                gv.CanReorderItems(false);
-                                Log(L"Native reorder off for the drag");
+                            auto gv = g_state.view.get();
+                            if (!gv || !g_state.dragItem) {
+                                return;
+                            }
+                            gv.CanReorderItems(false);
+                            Log(L"Native reorder off for the drag");
+                            if (CurrentSettings().probe) {
+                                ProbeDump();
+                            }
+                            auto it = g_state.anims.find(g_state.dragKey);
+                            auto c = gv.ContainerFromItem(g_state.dragItem).try_as<UIElement>();
+                            if (it != g_state.anims.end() && c) {
+                                Fade(it->second, c, std::nullopt, 0.0, kHideMs);
                             }
                         }));
                 }
@@ -853,13 +1465,25 @@ void HookPanel(const GridView& gv, const Controls::Panel& panel) {
     g_state.dragEndRevoker = gv.DragItemsCompleted(
         winrt::auto_revoke,
         Guarded([](auto&&, Controls::DragItemsCompletedEventArgs const&) {
+            std::wstring key = g_state.dragKey;
             g_state.dragItem = nullptr;
+            g_state.dragKey.clear();
             g_state.ignoreOrderUntil = GetTickCount64() + 1500;
             if (auto gv = g_state.view.get()) {
                 gv.CanReorderItems(g_state.origReorder);
             }
             HideHighlight();
+            // Cancelled: the others slide back, the dragged tile reappears
+            // where it was (or where it was dropped).
+            g_state.snapKey = key;
+            ClearPreview(false);
             Relayout();
+            g_state.snapKey.clear();
+            if (auto it = g_state.anims.find(key); it != g_state.anims.end()) {
+                if (auto c = it->second.container.get()) {
+                    Fade(it->second, c, 0.0, 1.0, kRevealMs, 0.85);
+                }
+            }
         }));
 
     // Remember the right-clicked tile, even when Start handles the event.
@@ -874,6 +1498,7 @@ void HookPanel(const GridView& gv, const Controls::Panel& panel) {
             }
         })));
     gv.AddHandler(UIElement::RightTappedEvent(), g_state.rightTappedHandler, true);
+    HookProbe(gv);
 }
 
 bool TryApply(const GridView& gv) {
@@ -925,8 +1550,8 @@ bool TryApply(const GridView& gv) {
 
     g_state.origReorder = gv.CanReorderItems();
     g_state.applied = true;
-    // Native reorder stays on: Start's folder drops depend on it. The mod
-    // takes over drops inside the grid that aren't onto a folder.
+    // Native reorder stays on outside drags (Start's menu moves); each drag
+    // inside the grid switches it off.
     // Start animates tiles between list slots; with cells that reads as
     // tiles flying in from the wrong place.
     g_state.origTransitions = gv.ReadLocalValue(
